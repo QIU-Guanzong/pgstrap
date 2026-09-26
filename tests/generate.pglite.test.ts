@@ -45,3 +45,36 @@ test("generate with pglite runs migrations and dumps structure", async () => {
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })
+
+test.each([undefined, "postgres://unused:unused@127.0.0.1:1/unreachable"])(
+  "failed generation restores DATABASE_URL (%s)",
+  async (databaseUrl) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pgstrap-failure-"))
+    const previous = process.env.DATABASE_URL
+    try {
+      if (databaseUrl === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = databaseUrl
+      const migrationsDir = path.join(tmp, "migrations")
+      fs.mkdirSync(migrationsDir)
+      fs.writeFileSync(
+        path.join(migrationsDir, "001_create_table.js"),
+        migrationFile,
+      )
+      fs.writeFileSync(path.join(tmp, "zapatos"), "not a directory")
+      await expect(
+        generate({
+          schemas: ["public"],
+          defaultDatabase: "postgres",
+          dbDir: tmp,
+          migrationsDir,
+          pglite: true,
+        }),
+      ).rejects.toThrow("EEXIST")
+      expect(process.env.DATABASE_URL).toBe(databaseUrl)
+    } finally {
+      if (previous === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = previous
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  },
+)
