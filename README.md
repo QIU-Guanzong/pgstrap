@@ -46,6 +46,8 @@ npm install pgstrap --save-dev
 
    Newly initialized projects use `pgstrap generate --pglite`. This runs the migrations in a temporary in-memory PGlite database, writes the generated files, and closes the database. It does not migrate your application database.
 
+   Offline generation ignores application database URLs, including `POSTGRES_URI` and `PG_URI`. Schema dumping runs in a separate local process connected only to the temporary database; the calling process's environment is not changed.
+
 6. When ready to apply the migrations to your running PostgreSQL database:
    ```bash
    npm run db:migrate

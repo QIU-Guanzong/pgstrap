@@ -1,13 +1,51 @@
 import * as zg from "zapatos/generate"
-import {
-  getConnectionStringFromEnv,
-  getPgConnectionFromEnv,
-} from "pg-connection-from-env"
+import { getConnectionStringFromEnv } from "pg-connection-from-env"
 import { Context } from "./get-project-context"
 import { dumpTree } from "pg-schema-dump"
 import path from "path"
 import type { AddressInfo, Socket } from "node:net"
+import { spawn } from "node:child_process"
 import { migrate } from "./migrate"
+
+// pg-schema-dump only accepts connection settings via the environment. Give it
+// an isolated process so application URLs cannot override the local gateway,
+// and concurrent callers never observe or restore each other's DATABASE_URL.
+const dumpPgliteTree = (
+  connectionString: string,
+  options: Parameters<typeof dumpTree>[0],
+) =>
+  new Promise<void>((resolve, reject) => {
+    const script = `require(${JSON.stringify(require.resolve("pg-schema-dump"))})
+      .dumpTree(${JSON.stringify(options)})
+      .catch(error => {
+        // The dependency can leave a socket open on query errors. This worker
+        // owns no caller resources, so exit after the diagnostic is flushed.
+        process.stderr.write("Schema dump failed: " + String(error.message) + "\\n", () => process.exit(1))
+      })`
+    const child = spawn(process.execPath, ["--eval", script], {
+      env: {
+        ...process.env,
+        POSTGRES_URI: connectionString,
+        PG_URI: connectionString,
+        DATABASE_URL: connectionString,
+        DATABASE_URI: connectionString,
+        PGSSLMODE: "disable",
+      },
+      stdio: ["ignore", "inherit", "pipe"],
+    })
+    let stderr = ""
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-65_536)
+    })
+    child.once("error", reject)
+    child.once("close", (code, signal) => {
+      if (code === 0) resolve()
+      else
+        reject(
+          new Error(stderr.trim() || `Schema dump failed (${signal ?? code})`),
+        )
+    })
+  })
 
 export const generate = async ({
   schemas,
@@ -56,8 +94,6 @@ export const generate = async ({
       }).catch(() => socket.destroy())
     })
 
-    const prevDbUrl = process.env.DATABASE_URL
-    let changedDbUrl = false
     try {
       await migrate({
         client: db as any,
@@ -76,27 +112,20 @@ export const generate = async ({
       })
       const port = (server.address() as AddressInfo).port
       const connectionString = `postgres://postgres:postgres@127.0.0.1:${port}/postgres`
-      process.env.DATABASE_URL = connectionString
-      changedDbUrl = true
-
       await zg.generate({
-        db: { connectionString },
+        db: { connectionString, ssl: false },
         schemas: Object.fromEntries(
           schemas.map((s) => [s, { include: "*", exclude: [] }]),
         ),
         outDir: dbDir,
       })
 
-      await dumpTree({
+      await dumpPgliteTree(connectionString, {
         targetDir: path.join(dbDir, "structure"),
         defaultDatabase: "postgres",
         schemas,
       })
     } finally {
-      if (changedDbUrl) {
-        if (prevDbUrl === undefined) delete process.env.DATABASE_URL
-        else process.env.DATABASE_URL = prevDbUrl
-      }
       for (const socket of sockets) socket.destroy()
       try {
         if (server.listening) {
